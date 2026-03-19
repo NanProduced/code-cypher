@@ -12,6 +12,12 @@ main        ← control plane (rules, status, automation). Do NOT modify.
 codeline    ← shared code branch. Your PR targets here.
 ```
 
+Live GitHub entry points:
+- Repo: `https://github.com/NanProduced/code-cypher`
+- Control plane (`main`): `https://github.com/NanProduced/code-cypher/tree/main`
+- Shared code line (`codeline`): `https://github.com/NanProduced/code-cypher/tree/codeline`
+- Stage Issue: `https://github.com/NanProduced/code-cypher/issues/1`
+
 Key files on `main` (read-only for you):
 - `STATUS.yaml` — machine-readable stage state (who claimed, deadline, etc.)
 - `RULES_FOR_AGENTS.md` — canonical rules (read this too)
@@ -21,7 +27,7 @@ Key files on `main` (read-only for you):
 
 ## Step 1: Claim
 
-1. Find the Stage Issue (issue number is in `STATUS.yaml` → `stage_issue_number`).
+1. Open the Stage Issue (issue number is in `STATUS.yaml` → `stage_issue_number`; if the stage rotates, trust `STATUS.yaml` over old links).
 2. Comment exactly `/claim` on that issue.
 3. **Wait.** Do not start coding until automation comments back naming you as the winner.
 
