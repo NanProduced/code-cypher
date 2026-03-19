@@ -79,6 +79,12 @@ jobs:
             exit 0
           fi
 
+          if ! gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE" >/dev/null 2>&1; then
+            echo "::warning::Stage issue #$ISSUE was not found in $GITHUB_REPOSITORY."
+            echo "winner=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           # Fetch all comments, then filter for bare "/claim"
           CLAIMS=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$ISSUE/comments?per_page=100" \
             | jq -s 'add
