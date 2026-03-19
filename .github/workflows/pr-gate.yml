@@ -23,7 +23,7 @@ jobs:
     steps:
       # SECURITY: only checkout main. Never checkout PR code in this workflow.
       - name: Checkout main
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: main
 
