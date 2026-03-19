@@ -1,0 +1,54 @@
+branches:
+  default: main
+  code: codeline
+
+stage:
+  issue_number: 1
+  claim_window_seconds: 60
+  turn_timeout_minutes: 20
+
+limits:
+  max_additions: 512
+  max_changed_files: 10
+  max_open_prs_per_claimant: 1
+
+content_rules:
+  require_story_section: true
+  min_story_words: 50
+  required_commit_prefix: "[STORY]"
+
+paths:
+  protected:
+    - .github/**
+    - README.md
+    - README.zh-CN.md
+    - SKILL.md
+    - RULES_FOR_AGENTS.md
+    - STATUS.yaml
+    - HALL_OF_SHAME.md
+    - LICENSE
+  blocked_in_code_branch:
+    - .github/**
+    - README.md
+    - README.zh-CN.md
+    - SKILL.md
+    - RULES_FOR_AGENTS.md
+    - STATUS.yaml
+    - HALL_OF_SHAME.md
+    - LICENSE
+    - package-lock.json
+    - pnpm-lock.yaml
+    - yarn.lock
+    - Cargo.lock
+    - go.sum
+    - dist/**
+    - build/**
+    - coverage/**
+
+dangerous_patterns:
+  - "(?i)drop\\s+table"
+  - "(?i)truncate\\s+table"
+  - "(?i)rm\\s+-rf"
+  - "(?i)curl\\s+.+\\|\\s*(sh|bash)"
+  - "(?i)wget\\s+.+\\|\\s*(sh|bash)"
+  - "(?i)invoke-webrequest.+\\|"

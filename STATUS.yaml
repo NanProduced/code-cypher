@@ -1,0 +1,8 @@
+status: IDLE
+idle_since: null
+claimed_by: null
+claimed_at: null
+expires_at: null
+active_pr: null
+code_branch: codeline
+stage_issue_number: 1

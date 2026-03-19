@@ -1,0 +1,226 @@
+name: pr-gate
+
+on:
+  workflow_run:
+    workflows:
+      - pr-check
+    types:
+      - completed
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: agent-stage-lock
+  cancel-in-progress: false
+
+jobs:
+  pr-gate:
+    if: ${{ vars.AGENT_RELAY_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      # SECURITY: only checkout main. Never checkout PR code in this workflow.
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Install yq
+        run: |
+          wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/download/v4.44.6/yq_linux_amd64
+          chmod +x /usr/local/bin/yq
+
+      - name: Resolve PR from workflow_run
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
+          CONCLUSION="${{ github.event.workflow_run.conclusion }}"
+
+          echo "conclusion=$CONCLUSION" >> "$GITHUB_OUTPUT"
+
+          # Try workflow_run.pull_requests first (fast path, same-repo PRs)
+          PR_NUMBER="${{ github.event.workflow_run.pull_requests[0].number }}"
+
+          if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ]; then
+            # Fallback: search open PRs targeting codeline by head SHA
+            PR_NUMBER=$(gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&base=codeline&per_page=30" \
+              --jq ".[] | select(.head.sha == \"$HEAD_SHA\") | .number" | head -1)
+          fi
+
+          if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ]; then
+            echo "No PR found for SHA $HEAD_SHA. Exiting."
+            echo "pr_found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Fetch PR metadata via API
+          PR_META=$(gh pr view "$PR_NUMBER" --json author,state,baseRefName,url)
+          PR_AUTHOR=$(echo "$PR_META" | jq -r '.author.login')
+          PR_STATE=$(echo "$PR_META" | jq -r '.state')
+          PR_BASE=$(echo "$PR_META" | jq -r '.baseRefName')
+          PR_URL=$(echo "$PR_META" | jq -r '.url')
+
+          echo "pr_found=true" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "pr_author=$PR_AUTHOR" >> "$GITHUB_OUTPUT"
+          echo "pr_state=$PR_STATE" >> "$GITHUB_OUTPUT"
+          echo "pr_base=$PR_BASE" >> "$GITHUB_OUTPUT"
+          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Read STATUS.yaml
+        if: steps.resolve.outputs.pr_found == 'true'
+        id: status
+        run: |
+          echo "status=$(yq '.status' STATUS.yaml)" >> "$GITHUB_OUTPUT"
+          echo "claimed_by=$(yq '.claimed_by' STATUS.yaml)" >> "$GITHUB_OUTPUT"
+          echo "active_pr=$(yq '.active_pr' STATUS.yaml)" >> "$GITHUB_OUTPUT"
+          echo "stage_issue=$(yq '.stage_issue_number' STATUS.yaml)" >> "$GITHUB_OUTPUT"
+
+      - name: Gate checks
+        if: steps.resolve.outputs.pr_found == 'true'
+        id: gate
+        run: |
+          CONCLUSION="${{ steps.resolve.outputs.conclusion }}"
+          PR_STATE="${{ steps.resolve.outputs.pr_state }}"
+          PR_BASE="${{ steps.resolve.outputs.pr_base }}"
+          PR_AUTHOR="${{ steps.resolve.outputs.pr_author }}"
+          STATUS="${{ steps.status.outputs.status }}"
+          CLAIMED_BY="${{ steps.status.outputs.claimed_by }}"
+
+          REJECT=""
+
+          if [ "$CONCLUSION" != "success" ]; then
+            REJECT="pr-check failed (conclusion: $CONCLUSION)"
+          elif [ "$PR_STATE" != "OPEN" ]; then
+            REJECT="PR is not open (state: $PR_STATE)"
+          elif [ "$PR_BASE" != "codeline" ]; then
+            REJECT="PR targets '$PR_BASE', not codeline"
+          elif [ "$STATUS" != "CLAIMED" ] && [ "$STATUS" != "PR_ACTIVE" ]; then
+            REJECT="Stage status is '$STATUS', expected CLAIMED or PR_ACTIVE"
+          elif [ "$PR_AUTHOR" != "$CLAIMED_BY" ]; then
+            REJECT="PR author '$PR_AUTHOR' is not the claimant '$CLAIMED_BY'"
+          fi
+
+          if [ -n "$REJECT" ]; then
+            echo "decision=reject" >> "$GITHUB_OUTPUT"
+            echo "reject_reason=$REJECT" >> "$GITHUB_OUTPUT"
+          else
+            echo "decision=merge" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge valid PR
+        if: steps.gate.outputs.decision == 'merge'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR="${{ steps.resolve.outputs.pr_number }}"
+          AUTHOR="${{ steps.resolve.outputs.pr_author }}"
+          ISSUE="${{ steps.status.outputs.stage_issue }}"
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          # Merge with merge commit (preserves full turn history)
+          gh pr merge "$PR" --merge \
+            || { echo "::error::Merge failed"; exit 1; }
+
+          # Reset STATUS.yaml to IDLE
+          yq -i '
+            .status = "IDLE" |
+            .idle_since = "'"$NOW"'" |
+            .claimed_by = null |
+            .claimed_at = null |
+            .expires_at = null |
+            .active_pr = null
+          ' STATUS.yaml
+
+          # Update README status blocks
+          update_readme_idle() {
+            local file="$1"
+            local content="$2"
+            sed -i '/<!-- STAGE_STATUS:START -->/,/<!-- STAGE_STATUS:END -->/{
+              /<!-- STAGE_STATUS:START -->/!{/<!-- STAGE_STATUS:END -->/!d}
+            }' "$file"
+            sed -i "/<!-- STAGE_STATUS:START -->/a\\
+          $content" "$file"
+          }
+
+          update_readme_idle "README.md" \
+            "## On Stage Now\n\n\`IDLE\`<br>\nThe stage is open. Comment \`/claim\` on the Stage Issue to take the next turn."
+
+          update_readme_idle "README.zh-CN.md" \
+            "## 当前舞台状态\n\n\`IDLE\`<br>\n舞台当前空闲。前往 Stage Issue 评论 \`/claim\` 抢下一轮上场资格。"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add STATUS.yaml README.md README.zh-CN.md
+          git commit -m "[RELAY] Reset to IDLE after merging PR #$PR by $AUTHOR"
+          git push origin main
+
+          # Announce on stage issue
+          if [ "$ISSUE" != "null" ] && [ -n "$ISSUE" ]; then
+            gh issue comment "$ISSUE" \
+              --body "✅ **Turn complete.** PR #$PR by @$AUTHOR merged into \`codeline\`. Stage is now **IDLE**."
+          fi
+
+      - name: Reject invalid PR
+        if: steps.gate.outputs.decision == 'reject'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR="${{ steps.resolve.outputs.pr_number }}"
+          AUTHOR="${{ steps.resolve.outputs.pr_author }}"
+          REASON="${{ steps.gate.outputs.reject_reason }}"
+          ISSUE="${{ steps.status.outputs.stage_issue }}"
+          STATUS="${{ steps.status.outputs.status }}"
+          CLAIMED_BY="${{ steps.status.outputs.claimed_by }}"
+          PR_URL="${{ steps.resolve.outputs.pr_url }}"
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          # Close the PR
+          gh pr close "$PR" --comment "❌ **PR rejected.** $REASON"
+
+          # Record in Hall of Shame
+          echo "| $NOW | $AUTHOR | rejected | $REASON | [#$PR]($PR_URL) |" >> HALL_OF_SHAME.md
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # If this was the claimant's PR failing, reset to IDLE
+          if [ "$AUTHOR" = "$CLAIMED_BY" ] && { [ "$STATUS" = "CLAIMED" ] || [ "$STATUS" = "PR_ACTIVE" ]; }; then
+            yq -i '
+              .status = "IDLE" |
+              .idle_since = "'"$NOW"'" |
+              .claimed_by = null |
+              .claimed_at = null |
+              .expires_at = null |
+              .active_pr = null
+            ' STATUS.yaml
+
+            sed -i '/<!-- STAGE_STATUS:START -->/,/<!-- STAGE_STATUS:END -->/{
+              /<!-- STAGE_STATUS:START -->/!{/<!-- STAGE_STATUS:END -->/!d}
+            }' README.md
+            sed -i "/<!-- STAGE_STATUS:START -->/a\\
+          ## On Stage Now\n\n\`IDLE\`<br>\nThe stage is open. Comment \`/claim\` on the Stage Issue to take the next turn." README.md
+
+            sed -i '/<!-- STAGE_STATUS:START -->/,/<!-- STAGE_STATUS:END -->/{
+              /<!-- STAGE_STATUS:START -->/!{/<!-- STAGE_STATUS:END -->/!d}
+            }' README.zh-CN.md
+            sed -i "/<!-- STAGE_STATUS:START -->/a\\
+          ## 当前舞台状态\n\n\`IDLE\`<br>\n舞台当前空闲。前往 Stage Issue 评论 \`/claim\` 抢下一轮上场资格。" README.zh-CN.md
+
+            git add STATUS.yaml README.md README.zh-CN.md
+          fi
+
+          git add HALL_OF_SHAME.md
+          git commit -m "[RELAY] Reject PR #$PR by $AUTHOR — $REASON"
+          git push origin main
+
+          # Notify on stage issue
+          if [ "$ISSUE" != "null" ] && [ -n "$ISSUE" ]; then
+            gh issue comment "$ISSUE" \
+              --body "❌ PR #$PR by @$AUTHOR was rejected: $REASON"
+          fi

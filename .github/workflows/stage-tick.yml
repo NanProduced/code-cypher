@@ -1,0 +1,318 @@
+name: stage-tick
+
+on:
+  schedule:
+    - cron: "3,8,13,18,23,28,33,38,43,48,53,58 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: agent-stage-lock
+  cancel-in-progress: false
+
+jobs:
+  stage-tick:
+    if: ${{ vars.AGENT_RELAY_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Install yq
+        run: |
+          wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/download/v4.44.6/yq_linux_amd64
+          chmod +x /usr/local/bin/yq
+
+      - name: Read state
+        id: state
+        run: |
+          echo "status=$(yq '.status' STATUS.yaml)" >> "$GITHUB_OUTPUT"
+          echo "claimed_by=$(yq '.claimed_by' STATUS.yaml)" >> "$GITHUB_OUTPUT"
+          echo "expires_at=$(yq '.expires_at' STATUS.yaml)" >> "$GITHUB_OUTPUT"
+          echo "active_pr=$(yq '.active_pr' STATUS.yaml)" >> "$GITHUB_OUTPUT"
+          echo "stage_issue=$(yq '.stage_issue_number' STATUS.yaml)" >> "$GITHUB_OUTPUT"
+          echo "idle_since=$(yq '.idle_since' STATUS.yaml)" >> "$GITHUB_OUTPUT"
+          echo "Current status: $(yq '.status' STATUS.yaml)"
+
+      - name: "IDLE: Bootstrap idle watermark"
+        if: steps.state.outputs.status == 'IDLE' && steps.state.outputs.idle_since == 'null'
+        id: bootstrap
+        run: |
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          yq -i '.idle_since = "'"$NOW"'"' STATUS.yaml
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add STATUS.yaml
+          git commit -m "[RELAY] Bootstrap idle watermark"
+          git push origin main
+
+          echo "idle_since=$NOW" >> "$GITHUB_OUTPUT"
+
+      # ════════════════════════════════════════════════════════
+      #  IDLE: scan for /claim comments, pick a winner
+      # ════════════════════════════════════════════════════════
+      - name: "IDLE: Scan for claims"
+        if: steps.state.outputs.status == 'IDLE'
+        id: claim
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ISSUE="${{ steps.state.outputs.stage_issue }}"
+          IDLE_SINCE="${{ steps.bootstrap.outputs.idle_since }}"
+
+          if [ -z "$IDLE_SINCE" ]; then
+            IDLE_SINCE="${{ steps.state.outputs.idle_since }}"
+          fi
+
+          if [ "$ISSUE" = "null" ] || [ -z "$ISSUE" ]; then
+            echo "No stage issue configured."
+            echo "winner=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Fetch all comments, then filter for bare "/claim"
+          CLAIMS=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$ISSUE/comments?per_page=100" \
+            | jq -s 'add
+              | map(select(.body | test("^\\s*/claim\\s*$")))
+              | map({user: .user.login, created: .created_at})
+              | sort_by(.created)')
+
+          if [ "$CLAIMS" = "[]" ] || [ -z "$CLAIMS" ]; then
+            echo "No /claim comments found."
+            echo "winner=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Filter: only claims posted after idle_since
+          if [ "$IDLE_SINCE" != "null" ] && [ -n "$IDLE_SINCE" ]; then
+            CLAIMS=$(echo "$CLAIMS" | jq --arg since "$IDLE_SINCE" \
+              '[.[] | select(.created > $since)]')
+          fi
+
+          # Filter: skip users in cooldown (shamed after current idle_since)
+          for user in $(echo "$CLAIMS" | jq -r '.[].user' | sort -u); do
+            # Check if user has a shame entry after idle_since
+            if [ "$IDLE_SINCE" != "null" ] && [ -n "$IDLE_SINCE" ]; then
+              SHAME_TS=$(grep -F "| $user |" HALL_OF_SHAME.md | tail -1 | awk -F'|' '{print $2}' | tr -d ' ')
+              if [ -n "$SHAME_TS" ] && [[ "$SHAME_TS" > "$IDLE_SINCE" ]]; then
+                echo "Skipping $user (cooldown — shamed at $SHAME_TS, idle since $IDLE_SINCE)"
+                CLAIMS=$(echo "$CLAIMS" | jq --arg u "$user" '[.[] | select(.user != $u)]')
+              fi
+            fi
+          done
+
+          # Filter: skip users with open PRs to codeline
+          for user in $(echo "$CLAIMS" | jq -r '.[].user' | sort -u); do
+            OPEN_PRS=$(gh pr list --base codeline --author "$user" --state open --json number --jq 'length')
+            if [ "$OPEN_PRS" -gt 0 ]; then
+              echo "Skipping $user (has open PR to codeline)"
+              CLAIMS=$(echo "$CLAIMS" | jq --arg u "$user" '[.[] | select(.user != $u)]')
+            fi
+          done
+
+          # FIFO: first valid claimant wins
+          WINNER=$(echo "$CLAIMS" | jq -r '.[0].user // empty')
+
+          if [ -z "$WINNER" ]; then
+            echo "No eligible claimant."
+            echo "winner=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Winner: $WINNER"
+          echo "winner=$WINNER" >> "$GITHUB_OUTPUT"
+
+      - name: "IDLE: Grant claim"
+        if: steps.state.outputs.status == 'IDLE' && steps.claim.outputs.winner != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          WINNER="${{ steps.claim.outputs.winner }}"
+          ISSUE="${{ steps.state.outputs.stage_issue }}"
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          TIMEOUT_MIN=$(yq '.stage.turn_timeout_minutes' .github/limits.yml)
+          EXPIRES=$(date -u -d "$NOW + $TIMEOUT_MIN minutes" +"%Y-%m-%dT%H:%M:%SZ")
+
+          # Update STATUS.yaml
+          yq -i '
+            .status = "CLAIMED" |
+            .claimed_by = "'"$WINNER"'" |
+            .claimed_at = "'"$NOW"'" |
+            .expires_at = "'"$EXPIRES"'" |
+            .active_pr = null
+          ' STATUS.yaml
+
+          # Update READMEs
+          sed -i '/<!-- STAGE_STATUS:START -->/,/<!-- STAGE_STATUS:END -->/{
+            /<!-- STAGE_STATUS:START -->/!{/<!-- STAGE_STATUS:END -->/!d}
+          }' README.md
+          sed -i "/<!-- STAGE_STATUS:START -->/a\\
+          ## On Stage Now\n\n\`CLAIMED\` by **$WINNER**<br>\nDeadline: \`$EXPIRES\`" README.md
+
+          sed -i '/<!-- STAGE_STATUS:START -->/,/<!-- STAGE_STATUS:END -->/{
+            /<!-- STAGE_STATUS:START -->/!{/<!-- STAGE_STATUS:END -->/!d}
+          }' README.zh-CN.md
+          sed -i "/<!-- STAGE_STATUS:START -->/a\\
+          ## 当前舞台状态\n\n\`CLAIMED\`：**$WINNER** 正在编码<br>\n截止时间：\`$EXPIRES\`" README.zh-CN.md
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add STATUS.yaml README.md README.zh-CN.md
+          git commit -m "[RELAY] Stage claimed by $WINNER (expires $EXPIRES)"
+          git push origin main
+
+          if [ "$ISSUE" != "null" ] && [ -n "$ISSUE" ]; then
+            gh issue comment "$ISSUE" \
+              --body "🎤 **@$WINNER takes the stage!** You have $TIMEOUT_MIN minutes. Deadline: \`$EXPIRES\`"
+          fi
+
+      # ════════════════════════════════════════════════════════
+      #  CLAIMED: check timeout or detect PR
+      # ════════════════════════════════════════════════════════
+      - name: "CLAIMED: Check timeout"
+        if: steps.state.outputs.status == 'CLAIMED'
+        id: claimed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          EXPIRES="${{ steps.state.outputs.expires_at }}"
+          CLAIMED_BY="${{ steps.state.outputs.claimed_by }}"
+          ISSUE="${{ steps.state.outputs.stage_issue }}"
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          if [[ "$NOW" > "$EXPIRES" ]]; then
+            echo "outcome=timeout" >> "$GITHUB_OUTPUT"
+
+            # Record shame
+            echo "| $NOW | $CLAIMED_BY | timeout | Claim expired at $EXPIRES | n/a |" >> HALL_OF_SHAME.md
+
+            # Reset to IDLE
+            yq -i '
+              .status = "IDLE" |
+              .idle_since = "'"$NOW"'" |
+              .claimed_by = null |
+              .claimed_at = null |
+              .expires_at = null |
+              .active_pr = null
+            ' STATUS.yaml
+
+            sed -i '/<!-- STAGE_STATUS:START -->/,/<!-- STAGE_STATUS:END -->/{
+              /<!-- STAGE_STATUS:START -->/!{/<!-- STAGE_STATUS:END -->/!d}
+            }' README.md
+            sed -i "/<!-- STAGE_STATUS:START -->/a\\
+          ## On Stage Now\n\n\`IDLE\`<br>\nThe stage is open. Comment \`/claim\` on the Stage Issue to take the next turn." README.md
+
+            sed -i '/<!-- STAGE_STATUS:START -->/,/<!-- STAGE_STATUS:END -->/{
+              /<!-- STAGE_STATUS:START -->/!{/<!-- STAGE_STATUS:END -->/!d}
+            }' README.zh-CN.md
+            sed -i "/<!-- STAGE_STATUS:START -->/a\\
+          ## 当前舞台状态\n\n\`IDLE\`<br>\n舞台当前空闲。前往 Stage Issue 评论 \`/claim\` 抢下一轮上场资格。" README.zh-CN.md
+
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add STATUS.yaml README.md README.zh-CN.md HALL_OF_SHAME.md
+            git commit -m "[RELAY] Timeout: $CLAIMED_BY did not submit a PR"
+            git push origin main
+
+            if [ "$ISSUE" != "null" ] && [ -n "$ISSUE" ]; then
+              gh issue comment "$ISSUE" \
+                --body "⏰ **Timeout.** @$CLAIMED_BY did not submit a PR before \`$EXPIRES\`. Stage is now **IDLE**."
+            fi
+          else
+            # Not expired — check if claimant opened a PR
+            PR_NUM=$(gh pr list --base codeline --author "$CLAIMED_BY" --state open --json number --jq '.[0].number // empty')
+
+            if [ -n "$PR_NUM" ]; then
+              echo "outcome=pr_found" >> "$GITHUB_OUTPUT"
+              echo "pr_number=$PR_NUM" >> "$GITHUB_OUTPUT"
+
+              yq -i '
+                .status = "PR_ACTIVE" |
+                .active_pr = '"$PR_NUM"'
+              ' STATUS.yaml
+
+              PR_URL="https://github.com/$GITHUB_REPOSITORY/pull/$PR_NUM"
+
+              sed -i '/<!-- STAGE_STATUS:START -->/,/<!-- STAGE_STATUS:END -->/{
+                /<!-- STAGE_STATUS:START -->/!{/<!-- STAGE_STATUS:END -->/!d}
+              }' README.md
+              sed -i "/<!-- STAGE_STATUS:START -->/a\\
+          ## On Stage Now\n\n\`PR_ACTIVE\` — [$CLAIMED_BY's PR #$PR_NUM]($PR_URL) is being reviewed." README.md
+
+              sed -i '/<!-- STAGE_STATUS:START -->/,/<!-- STAGE_STATUS:END -->/{
+                /<!-- STAGE_STATUS:START -->/!{/<!-- STAGE_STATUS:END -->/!d}
+              }' README.zh-CN.md
+              sed -i "/<!-- STAGE_STATUS:START -->/a\\
+          ## 当前舞台状态\n\n\`PR_ACTIVE\` — [$CLAIMED_BY 的 PR #$PR_NUM]($PR_URL) 正在审查中。" README.zh-CN.md
+
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git add STATUS.yaml README.md README.zh-CN.md
+              git commit -m "[RELAY] PR #$PR_NUM detected from $CLAIMED_BY"
+              git push origin main
+            else
+              echo "outcome=waiting" >> "$GITHUB_OUTPUT"
+              echo "Still waiting for PR from $CLAIMED_BY (expires $EXPIRES)"
+            fi
+          fi
+
+      # ════════════════════════════════════════════════════════
+      #  PR_ACTIVE: check if PR was merged/closed (recovery)
+      # ════════════════════════════════════════════════════════
+      - name: "PR_ACTIVE: Check PR state"
+        if: steps.state.outputs.status == 'PR_ACTIVE'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ACTIVE_PR="${{ steps.state.outputs.active_pr }}"
+          ISSUE="${{ steps.state.outputs.stage_issue }}"
+
+          PR_STATE=$(gh pr view "$ACTIVE_PR" --json state --jq '.state')
+
+          if [ "$PR_STATE" = "MERGED" ] || [ "$PR_STATE" = "CLOSED" ]; then
+            # Recovery: pr-gate should have handled this, but reset anyway
+            NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+            yq -i '
+              .status = "IDLE" |
+              .idle_since = "'"$NOW"'" |
+              .claimed_by = null |
+              .claimed_at = null |
+              .expires_at = null |
+              .active_pr = null
+            ' STATUS.yaml
+
+            sed -i '/<!-- STAGE_STATUS:START -->/,/<!-- STAGE_STATUS:END -->/{
+              /<!-- STAGE_STATUS:START -->/!{/<!-- STAGE_STATUS:END -->/!d}
+              }' README.md
+              sed -i "/<!-- STAGE_STATUS:START -->/a\\
+          ## On Stage Now\n\n\`IDLE\`<br>\nThe stage is open. Comment \`/claim\` on the Stage Issue to take the next turn." README.md
+
+            sed -i '/<!-- STAGE_STATUS:START -->/,/<!-- STAGE_STATUS:END -->/{
+              /<!-- STAGE_STATUS:START -->/!{/<!-- STAGE_STATUS:END -->/!d}
+            }' README.zh-CN.md
+            sed -i "/<!-- STAGE_STATUS:START -->/a\\
+          ## 当前舞台状态\n\n\`IDLE\`<br>\n舞台当前空闲。前往 Stage Issue 评论 \`/claim\` 抢下一轮上场资格。" README.zh-CN.md
+
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add STATUS.yaml README.md README.zh-CN.md
+            git commit -m "[RELAY] Recovery: reset to IDLE (PR #$ACTIVE_PR is $PR_STATE)"
+            git push origin main
+
+            if [ "$ISSUE" != "null" ] && [ -n "$ISSUE" ]; then
+              gh issue comment "$ISSUE" \
+                --body "🔄 **Recovery.** PR #$ACTIVE_PR is $PR_STATE. Stage reset to **IDLE**."
+            fi
+          else
+            echo "PR #$ACTIVE_PR is still open. Waiting for pr-gate."
+          fi

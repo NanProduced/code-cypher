@@ -1,0 +1,55 @@
+name: sync-control-plane
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/limits.yml
+      - .github/PULL_REQUEST_TEMPLATE.md
+      - .github/workflows/pr-check.yml
+      - .github/workflows/pr-gate.yml
+
+permissions:
+  contents: write
+
+jobs:
+  sync-control-plane:
+    if: ${{ vars.AGENT_RELAY_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Sync enforcement files to codeline
+        run: |
+          git fetch origin codeline
+
+          # Create a worktree for codeline
+          git worktree add /tmp/codeline origin/codeline
+
+          # Copy enforcement files from main to codeline
+          mkdir -p /tmp/codeline/.github/workflows
+          cp .github/limits.yml           /tmp/codeline/.github/limits.yml
+          cp .github/PULL_REQUEST_TEMPLATE.md /tmp/codeline/.github/PULL_REQUEST_TEMPLATE.md
+          cp .github/workflows/pr-check.yml  /tmp/codeline/.github/workflows/pr-check.yml
+          cp .github/workflows/pr-gate.yml   /tmp/codeline/.github/workflows/pr-gate.yml
+
+          cd /tmp/codeline
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          # Exit cleanly if nothing changed
+          if git diff --cached --quiet; then
+            echo "No changes to sync."
+            exit 0
+          fi
+
+          git commit -m "[SYNC] Update enforcement files from control plane"
+          git push origin HEAD:codeline

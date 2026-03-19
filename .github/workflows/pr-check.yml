@@ -1,0 +1,158 @@
+name: pr-check
+
+on:
+  pull_request:
+    branches:
+      - codeline
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - edited
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  pr-check:
+    if: ${{ vars.AGENT_RELAY_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch base branches
+        run: |
+          git fetch origin main
+          git fetch origin codeline
+
+      - name: Install yq
+        run: |
+          wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/download/v4.44.6/yq_linux_amd64
+          chmod +x /usr/local/bin/yq
+
+      - name: Parse trusted limits from main
+        id: limits
+        run: |
+          # SECURITY: fetch limits from origin/main, never from PR head
+          git show origin/main:.github/limits.yml > /tmp/limits.yml
+
+          MAX_ADDITIONS=$(yq '.limits.max_additions' /tmp/limits.yml)
+          MAX_FILES=$(yq '.limits.max_changed_files' /tmp/limits.yml)
+          MAX_OPEN_PRS=$(yq '.limits.max_open_prs_per_claimant' /tmp/limits.yml)
+          COMMIT_PREFIX=$(yq '.content_rules.required_commit_prefix' /tmp/limits.yml)
+          MIN_STORY_WORDS=$(yq '.content_rules.min_story_words' /tmp/limits.yml)
+
+          echo "max_additions=$MAX_ADDITIONS" >> "$GITHUB_OUTPUT"
+          echo "max_files=$MAX_FILES" >> "$GITHUB_OUTPUT"
+          echo "max_open_prs=$MAX_OPEN_PRS" >> "$GITHUB_OUTPUT"
+          echo "commit_prefix=$COMMIT_PREFIX" >> "$GITHUB_OUTPUT"
+          echo "min_story_words=$MIN_STORY_WORDS" >> "$GITHUB_OUTPUT"
+
+          # Extract blocked paths as newline-separated list
+          yq '.paths.blocked_in_code_branch[]' /tmp/limits.yml > /tmp/blocked_paths.txt
+
+          # Extract dangerous patterns
+          yq '.dangerous_patterns[]' /tmp/limits.yml > /tmp/dangerous_patterns.txt
+
+      - name: Run all checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          MAX_ADDITIONS: ${{ steps.limits.outputs.max_additions }}
+          MAX_FILES: ${{ steps.limits.outputs.max_files }}
+          MAX_OPEN_PRS: ${{ steps.limits.outputs.max_open_prs }}
+          COMMIT_PREFIX: ${{ steps.limits.outputs.commit_prefix }}
+          MIN_STORY_WORDS: ${{ steps.limits.outputs.min_story_words }}
+        run: |
+          VIOLATIONS=""
+
+          # ── Diff size ──────────────────────────────────────────
+          DIFF_STAT=$(git diff --numstat origin/codeline...HEAD)
+          TOTAL_ADD=0
+          FILE_COUNT=0
+          while IFS=$'\t' read -r added removed file; do
+            [ -z "$file" ] && continue
+            # Binary files show "-" for added/removed
+            if [ "$added" = "-" ] || [ "$removed" = "-" ]; then
+              VIOLATIONS="${VIOLATIONS}- **Binary file**: \`${file}\` is binary or non-text, which is not allowed in relay turns\n"
+            else
+              TOTAL_ADD=$((TOTAL_ADD + added))
+            fi
+            FILE_COUNT=$((FILE_COUNT + 1))
+          done <<< "$DIFF_STAT"
+
+          if [ "$TOTAL_ADD" -gt "$MAX_ADDITIONS" ]; then
+            VIOLATIONS="${VIOLATIONS}- **Additions**: ${TOTAL_ADD} exceeds limit of ${MAX_ADDITIONS}\n"
+          fi
+          if [ "$FILE_COUNT" -gt "$MAX_FILES" ]; then
+            VIOLATIONS="${VIOLATIONS}- **Changed files**: ${FILE_COUNT} exceeds limit of ${MAX_FILES}\n"
+          fi
+
+          # ── Blocked paths ──────────────────────────────────────
+          CHANGED_FILES=$(git diff --name-only origin/codeline...HEAD)
+          while IFS= read -r pattern; do
+            [ -z "$pattern" ] && continue
+            while IFS= read -r file; do
+              [ -z "$file" ] && continue
+              # bash glob matching: ** matches any depth, * matches one segment
+              if [[ "$file" == $pattern ]]; then
+                VIOLATIONS="${VIOLATIONS}- **Blocked path**: \`${file}\` matches \`${pattern}\`\n"
+              fi
+            done <<< "$CHANGED_FILES"
+          done < /tmp/blocked_paths.txt
+
+          # ── Dangerous patterns ─────────────────────────────────
+          FULL_DIFF=$(git diff origin/codeline...HEAD)
+          while IFS= read -r pattern; do
+            [ -z "$pattern" ] && continue
+            if echo "$FULL_DIFF" | grep -P "$pattern" > /dev/null 2>&1; then
+              VIOLATIONS="${VIOLATIONS}- **Dangerous pattern**: \`${pattern}\` found in diff\n"
+            fi
+          done < /tmp/dangerous_patterns.txt
+
+          # ── Commit prefix ──────────────────────────────────────
+          while IFS= read -r subject; do
+            [ -z "$subject" ] && continue
+            if [[ "$subject" != "${COMMIT_PREFIX}"* ]]; then
+              VIOLATIONS="${VIOLATIONS}- **Commit prefix**: \`${subject:0:60}\` does not start with \`${COMMIT_PREFIX}\`\n"
+            fi
+          done < <(git log origin/codeline..HEAD --format=%s)
+
+          # ── Open PR count ──────────────────────────────────────
+          OPEN_PR_JSON=$(gh pr list --base codeline --author "$PR_AUTHOR" --state open --json number)
+          OTHER_OPEN_PRS=$(echo "$OPEN_PR_JSON" | jq --argjson current "$PR_NUMBER" \
+            'map(select(.number != $current)) | length')
+          if [ "$OTHER_OPEN_PRS" -ge "$MAX_OPEN_PRS" ]; then
+            VIOLATIONS="${VIOLATIONS}- **Open PR limit**: $PR_AUTHOR already has ${OTHER_OPEN_PRS} other open PR(s) to \`codeline\`\n"
+          fi
+
+          # ── Story section ──────────────────────────────────────
+          PR_BODY=$(gh pr view "$PR_NUMBER" --json body --jq '.body')
+
+          STORY=$(echo "$PR_BODY" | sed -n '/^## The Story/,/^## /{/^## The Story/d;/^## /d;p;}')
+          if [ -z "$STORY" ]; then
+            VIOLATIONS="${VIOLATIONS}- **Story section**: PR body is missing a \`## The Story\` section\n"
+          else
+            WORD_COUNT=$(echo "$STORY" | sed 's/<!--.*-->//g' | tr -s '[:space:]' '\n' \
+              | grep -c '[a-zA-Z0-9]' || echo 0)
+            if [ "$WORD_COUNT" -lt "$MIN_STORY_WORDS" ]; then
+              VIOLATIONS="${VIOLATIONS}- **Story length**: ${WORD_COUNT} words (minimum: ${MIN_STORY_WORDS})\n"
+            fi
+          fi
+
+          # ── Report ─────────────────────────────────────────────
+          if [ -n "$VIOLATIONS" ]; then
+            COMMENT_BODY=$(printf "## ❌ PR Check Failed\n\n%b\n\nPlease fix these issues and push again." "$VIOLATIONS")
+            gh pr comment "$PR_NUMBER" --body "$COMMENT_BODY" || true
+            echo "::error::PR check failed with violations"
+            echo -e "$VIOLATIONS"
+            exit 1
+          fi
+
+          echo "All checks passed."
